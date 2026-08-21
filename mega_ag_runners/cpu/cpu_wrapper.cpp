@@ -1,0 +1,302 @@
+/*
+ * Copyright (c) 2025-2026 CipherFlow (Shenzhen) Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/** @file cpu_wrapper.cpp
+ * @brief CPU wrapper implementation for MegaAG execution
+ */
+
+#include "../mega_ag.h"
+#include "../cpu_task_utils.h"
+#include "../../fhe_ops_lib/fhe_lib_v2.h"
+#include "../../lib/thread_pool/BS_thread_pool.hpp"
+#include "../../lib/gsl/span"
+
+#ifdef LATTISENSE_DEV
+#    include "../cpu_mem_monitor.h"
+#endif
+
+extern "C" {
+#include "../wrapper.h"
+}
+
+#include <chrono>
+#include <iostream>
+#include <any>
+#include <memory>
+#include <thread>
+
+namespace cpu_wrapper {
+
+using namespace fhe_ops_lib;
+
+template <typename TContext>
+std::vector<Handle*> extract_input_handles(CArgument* input_args, uint64_t n_in_args, TContext& context) {
+    std::vector<Handle*> input_handles;
+    for (uint64_t i = 0; i < n_in_args; ++i) {
+        auto& arg = input_args[i];
+        switch (arg.type) {
+            case TYPE_PLAINTEXT:
+            case TYPE_CIPHERTEXT: {
+                Handle** handle_array = static_cast<Handle**>(arg.data);
+                for (int j = 0; j < arg.size; ++j) {
+                    input_handles.push_back(handle_array[j]);
+                }
+                break;
+            }
+            case TYPE_RELIN_KEY: {
+                Handle** handle_array = static_cast<Handle**>(arg.data);
+                for (int j = 0; j < arg.size; ++j) {
+                    RelinKey* rlk_ptr = static_cast<RelinKey*>(handle_array[j]);
+                    context.set_context_relin_key(*rlk_ptr);
+                }
+                break;
+            }
+            case TYPE_GALOIS_KEY: {
+                Handle** handle_array = static_cast<Handle**>(arg.data);
+                for (int j = 0; j < arg.size; ++j) {
+                    GaloisKey* glk_ptr = static_cast<GaloisKey*>(handle_array[j]);
+                    context.set_context_galois_key(*glk_ptr);
+                }
+                break;
+            }
+            case TYPE_SWITCH_KEY: {
+                if constexpr (std::is_same_v<TContext, CkksBtpContext>) {
+                    Handle** handle_array = static_cast<Handle**>(arg.data);
+                    std::string key_id(arg.id);
+                    for (int j = 0; j < arg.size; ++j) {
+                        KeySwitchKey* swk_ptr = static_cast<KeySwitchKey*>(handle_array[j]);
+                        if (key_id == "swk_dts") {
+                            context.set_context_switch_key_dts(*swk_ptr);
+                        } else if (key_id == "swk_std") {
+                            context.set_context_switch_key_std(*swk_ptr);
+                        }
+                    }
+                } else {
+                    throw std::runtime_error("TYPE_SWITCH_KEY is only supported for CkksBtpContext");
+                }
+                break;
+            }
+            default: throw std::runtime_error("Unknown argument type in extract_input_handles");
+        }
+    }
+    return input_handles;
+}
+
+std::vector<Handle*> extract_output_handles(CArgument* output_args, uint64_t n_out_args) {
+    std::vector<Handle*> output_handles;
+    for (uint64_t i = 0; i < n_out_args; ++i) {
+        Handle** handle_array = static_cast<Handle**>(output_args[i].data);
+        for (int j = 0; j < output_args[i].size; ++j) {
+            output_handles.push_back(handle_array[j]);
+        }
+    }
+    return output_handles;
+}
+
+template <HEScheme SchemeType, typename TContext>
+void init_context(const nlohmann::json& param_json, std::unique_ptr<TContext>& context) {
+    auto n = param_json["n"].get<int>();
+
+    auto max_level = param_json["max_level"].get<int>();
+    auto q = param_json["q"].get<std::vector<uint64_t>>();
+    auto p = param_json["p"].get<std::vector<uint64_t>>();
+
+    if constexpr (SchemeType == HEScheme::CKKS) {
+        if constexpr (std::is_same_v<TContext, CkksBtpContext>) {
+            // Create CkksBtpContext for bootstrap
+            int cts_start_level = param_json["btp_cts_start_level"].get<int>();
+            int eval_mod_start_level = param_json["btp_eval_mod_start_level"].get<int>();
+            int stc_start_level = param_json["btp_stc_start_level"].get<int>();
+            double scale = param_json["scale"].get<double>();
+
+            if (n == 1 << 13) {
+                CkksBtpParameter btp_param = CkksBtpParameter::create_toy_parameter();
+                context = std::make_unique<TContext>(CkksBtpContext::create_empty_context(btp_param));
+            } else if (n == 1 << 16) {
+                std::string btp_param_name = param_json.value("btp_param_name", std::string{});
+                CkksBtpParameter btp_param = btp_param_name.empty()
+                    ? CkksBtpParameter::create_parameter()
+                    : CkksBtpParameter::create_parameter_by_name(btp_param_name);
+                context = std::make_unique<TContext>(CkksBtpContext::create_empty_context(btp_param));
+            }
+        } else {
+            // Create regular CkksContext
+            CkksParameter param = CkksParameter::create_custom_parameter(n, q, p);
+            context = std::make_unique<TContext>(CkksContext::create_empty_context(param));
+        }
+
+    } else if constexpr (SchemeType == HEScheme::BFV) {
+        auto t = param_json["t"].get<uint64_t>();
+        BfvParameter param = BfvParameter::create_custom_parameter(n, t, q, p);
+        context = std::make_unique<TContext>(BfvContext::create_empty_context(param));
+    }
+}
+
+template <HEScheme SchemeType, typename TContext>
+void _run_mega_ag_impl(gsl::span<CArgument> input_args,
+                       gsl::span<CArgument> output_args,
+                       const MegaAG& mega_ag,
+                       ProgressCallback progress_cb = nullptr) {
+    std::unique_ptr<TContext> context;
+    init_context<SchemeType, TContext>(mega_ag.parameter, input_args, context);
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    int num_threads = std::min(32, static_cast<int>(std::thread::hardware_concurrency()));
+    BS::priority_thread_pool pool(num_threads);
+
+    // Extract input handles and build available_data map
+    std::vector<void*> input_handles = extract_input_handles(input_args, false);
+    std::unordered_map<NodeIndex, std::any> available_data = init_available_data(mega_ag, input_handles);
+
+    // Build output handle map for IMPORT_FROM_ABI get_other_args
+    std::unordered_map<NodeIndex, void*> output_handle_map = extract_output_handle_map(mega_ag, output_args);
+
+    // Provide output dest pointers to IMPORT_FROM_ABI nodes via get_other_args
+    auto get_other_args = [&output_handle_map](const ComputeNode& node) -> std::vector<std::any> {
+        if (node.fhe_prop.has_value() && node.fhe_prop->op_type == OperationType::IMPORT_FROM_ABI) {
+            const DatumNode* output_node = node.output_nodes[0];
+            auto it = output_handle_map.find(output_node->index);
+            if (it != output_handle_map.end()) {
+                return {it->second};
+            }
+        }
+        return {};
+    };
+
+    // Run CPU tasks in thread pool
+#ifdef LATTISENSE_DEV
+    MemoryMonitor mem_monitor(100);  // sample every 100 ms
+    mem_monitor.start(MemoryMonitor::next_csv_path("mem_usage_cpu"));
+#endif
+    run_tasks(mega_ag, pool, context, available_data, get_other_args, nullptr, nullptr, progress_cb);
+#ifdef LATTISENSE_DEV
+    mem_monitor.stop();
+#endif
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+#ifdef LATTISENSE_DEV
+    std::cout << "Run CPU mega_ag time: " << duration.count() << " milliseconds" << std::endl;
+#endif
+}
+
+template <HEScheme SchemeType>
+void _run_mega_ag(gsl::span<CArgument> input_args,
+                  gsl::span<CArgument> output_args,
+                  const MegaAG& mega_ag,
+                  ProgressCallback progress_cb = nullptr) {
+    // Determine TContext based on SchemeType and bootstrap parameters
+    if constexpr (SchemeType == HEScheme::CKKS) {
+        // Check if bootstrap parameters exist
+        if (mega_ag.parameter.contains("btp_output_level")) {
+            // Use CkksBtpContext for bootstrap
+            using TContext = CkksBtpContext;
+            _run_mega_ag_impl<SchemeType, TContext>(input_args, output_args, mega_ag, progress_cb);
+        } else {
+            // Use regular CkksContext
+            using TContext = CkksContext;
+            _run_mega_ag_impl<SchemeType, TContext>(input_args, output_args, mega_ag, progress_cb);
+        }
+    } else {
+        // BFV always uses BfvContext
+        using TContext = BfvContext;
+        _run_mega_ag_impl<SchemeType, TContext>(input_args, output_args, mega_ag, progress_cb);
+    }
+}
+
+class FheCpuTask {
+public:
+    FheCpuTask(const std::string& project_path)
+        : mega_ag_(MegaAG::load(project_path + "/mega_ag.json", Processor::CPU)) {}
+
+    ~FheCpuTask() {}
+
+    void bind_custom_executors(const std::unordered_map<std::string, ExecutorFunc>& custom_executors) {
+        mega_ag_.bind_custom_executors(custom_executors);
+    }
+
+    void bind_abi_bridge_executors(const ExecutorFunc& abi_export, const ExecutorFunc& abi_import) {
+        mega_ag_.bind_abi_bridge_executors(abi_export, abi_import);
+    }
+
+    int run(gsl::span<CArgument> input_args, gsl::span<CArgument> output_args, ProgressCallback progress_cb = nullptr) {
+        switch (mega_ag_.algo) {
+            case Algo::ALGO_BFV: _run_mega_ag<HEScheme::BFV>(input_args, output_args, mega_ag_, progress_cb); break;
+            case Algo::ALGO_CKKS: _run_mega_ag<HEScheme::CKKS>(input_args, output_args, mega_ag_, progress_cb); break;
+            default: throw std::invalid_argument("algo not supported"); break;
+        }
+
+        return 0;
+    }
+
+protected:
+    MegaAG mega_ag_;
+};
+};  // namespace cpu_wrapper
+
+extern "C" {
+fhe_task_handle create_fhe_cpu_task(const char* project_path) {
+    cpu_wrapper::FheCpuTask* task = new cpu_wrapper::FheCpuTask(project_path);
+    return (fhe_task_handle)task;
+}
+
+void release_fhe_cpu_task(fhe_task_handle handle) {
+    cpu_wrapper::FheCpuTask* task = (cpu_wrapper::FheCpuTask*)handle;
+    delete task;
+}
+
+void bind_cpu_task_custom_executors(fhe_task_handle handle,
+                                    const char** custom_types,
+                                    void** executors,
+                                    uint64_t n_executors) {
+    cpu_wrapper::FheCpuTask* task = (cpu_wrapper::FheCpuTask*)handle;
+    std::unordered_map<std::string, ExecutorFunc> custom_executors;
+    for (uint64_t i = 0; i < n_executors; i++) {
+        ExecutorFunc* executor_ptr = reinterpret_cast<ExecutorFunc*>(executors[i]);
+        custom_executors[std::string(custom_types[i])] = *executor_ptr;
+    }
+    task->bind_custom_executors(custom_executors);
+}
+
+void bind_cpu_task_abi_bridge_executors(fhe_task_handle handle, void* abi_export_executor, void* abi_import_executor) {
+    cpu_wrapper::FheCpuTask* task = (cpu_wrapper::FheCpuTask*)handle;
+    ExecutorFunc* export_executor = reinterpret_cast<ExecutorFunc*>(abi_export_executor);
+    ExecutorFunc* import_executor = reinterpret_cast<ExecutorFunc*>(abi_import_executor);
+    task->bind_abi_bridge_executors(*export_executor, *import_executor);
+}
+
+int run_fhe_cpu_task(fhe_task_handle handle,
+                     CArgument* input_args,
+                     uint64_t n_in_args,
+                     CArgument* output_args,
+                     uint64_t n_out_args,
+                     progress_callback_t progress_cb,
+                     void* user_data) {
+    cpu_wrapper::FheCpuTask* task = (cpu_wrapper::FheCpuTask*)handle;
+    gsl::span<CArgument> input_arg_span{input_args, n_in_args};
+    gsl::span<CArgument> output_arg_span{output_args, n_out_args};
+
+    // Wrap C callback into ProgressCallback (std::function)
+    ProgressCallback cb;
+    if (progress_cb) {
+        cb = [progress_cb, user_data](int completed, int total) { progress_cb(completed, total, user_data); };
+    }
+    return task->run(input_arg_span, output_arg_span, cb);
+}
+}  // extern "C"

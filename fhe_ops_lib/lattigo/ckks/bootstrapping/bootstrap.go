@@ -1,0 +1,291 @@
+// Package bootstrapping implement the bootstrapping for the CKKS scheme.
+package bootstrapping
+
+import (
+	"fmt"
+	"math"
+	"os"
+
+	"github.com/cipherflow-fhe/lattigo/ckks"
+	"github.com/cipherflow-fhe/lattigo/ring"
+)
+
+// Bootstrapp re-encrypts a ciphertext at lvl Q0 to a ciphertext at MaxLevel-k where k is the depth of the bootstrapping circuit.
+// If the input ciphertext level is zero, the input scale must be an exact power of two smaller or equal to round(Q0/2^{10}).
+// If the input ciphertext is at level one or more, the input scale does not need to be an exact power of two as one level
+// can be used to do a scale matching.
+// btpDebugEnabled controls per-step BTP diagnostic output (stderr).
+// Set to true only during debugging.
+var btpDebugEnabled = false
+
+// btpDebugDecryptor and btpDebugEncoder are used for per-step decryption during debug.
+var btpDebugDecryptor ckks.Decryptor
+var btpDebugEncoder ckks.Encoder
+
+// SetBtpDebug enables or disables BTP step-level diagnostic output.
+func SetBtpDebug(enabled bool) {
+	btpDebugEnabled = enabled
+}
+
+// SetBtpDebugDecryptor sets the decryptor and encoder used for per-step debug decryption.
+// Set to nil to disable.
+func SetBtpDebugDecryptor(dec ckks.Decryptor, enc ckks.Encoder) {
+	btpDebugDecryptor = dec
+	btpDebugEncoder = enc
+}
+
+func btpDecryptPrint(label string, ct *ckks.Ciphertext, logSlots int) {
+	if btpDebugDecryptor == nil || !btpDebugEnabled {
+		return
+	}
+	pt := btpDebugDecryptor.DecryptNew(ct)
+	vals := btpDebugEncoder.Decode(pt, logSlots)
+	n := 16
+	if len(vals) < n {
+		n = len(vals)
+	}
+	// Also find max abs value
+	var maxAbs float64
+	var maxIdx int
+	for i, v := range vals {
+		a := math.Abs(real(v))
+		if a > maxAbs {
+			maxAbs = a
+			maxIdx = i
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[BTP-SLOTS] %s scale=2^%.1f level=%d maxAbs=%.4f@%d: ", label, math.Log2(ct.Scale), ct.Level(), maxAbs, maxIdx)
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(os.Stderr, "[%d]=%.6f ", i, real(vals[i]))
+	}
+	fmt.Fprintf(os.Stderr, "\n")
+}
+
+func btpLog(format string, args ...interface{}) {
+	if btpDebugEnabled {
+		fmt.Fprintf(os.Stderr, "[BTP-DIAG] "+format+"\n", args...)
+	}
+}
+
+func ctNorm(ct *ckks.Ciphertext) float64 {
+	// Compute the L2 norm of the first polynomial's coefficients (as a rough diagnostic)
+	if len(ct.Value) == 0 || ct.Value[0] == nil {
+		return 0
+	}
+	coeffs := ct.Value[0].Coeffs
+	if len(coeffs) == 0 {
+		return 0
+	}
+	var sumSq float64
+	q := float64(coeffs[0][0]) // just use first ring for approximation
+	_ = q
+	for _, c := range coeffs[0] {
+		v := float64(c)
+		// center around 0
+		if v > float64(^uint64(0)>>1) {
+			v = v - float64(^uint64(0)) - 1
+		}
+		sumSq += v * v
+	}
+	return math.Sqrt(sumSq)
+}
+
+func (btp *Bootstrapper) Bootstrapp(ctIn *ckks.Ciphertext) (ctOut *ckks.Ciphertext) {
+
+	ctOut = ctIn.CopyNew()
+
+	btpLog("INPUT: level=%d scale=2^%.2f", ctOut.Level(), math.Log2(ctOut.Scale))
+
+	// Drops the level to 1
+	for ctOut.Level() > 1 {
+		btp.DropLevel(ctOut, 1)
+	}
+
+	btpLog("AFTER-DROP-TO-1: level=%d scale=2^%.2f", ctOut.Level(), math.Log2(ctOut.Scale))
+
+	// Brings the ciphertext scale to Q0/MessageRatio
+	if ctOut.Level() == 1 {
+
+		// If one level is available, then uses it to match the scale
+		btp.SetScale(ctOut, btp.q0OverMessageRatio)
+
+		btpLog("AFTER-SETSCALE: level=%d scale=2^%.2f q0OverMsgRatio=2^%.2f",
+			ctOut.Level(), math.Log2(ctOut.Scale), math.Log2(btp.q0OverMessageRatio))
+
+		// Then drops to level 0
+		for ctOut.Level() != 0 {
+			btp.DropLevel(ctOut, 1)
+		}
+
+	} else {
+
+		// Does an integer constant mult by round((Q0/Delta_m)/ctscle)
+		if btp.q0OverMessageRatio < ctOut.Scale {
+			panic("Cannot bootstrap: ciphetext scale > q/||m||)")
+		}
+
+		btp.ScaleUp(ctOut, math.Round(btp.q0OverMessageRatio/ctOut.Scale), ctOut)
+	}
+
+	btpLog("AFTER-DROP-TO-0: level=%d scale=2^%.2f", ctOut.Level(), math.Log2(ctOut.Scale))
+
+	// Scales the message to Q0/|m|, which is the maximum possible before ModRaise to avoid plaintext overflow.
+	if math.Round((btp.params.QiFloat64(0)/btp.evalModPoly.MessageRatio())/ctOut.Scale) > 1 {
+		btpLog("SCALEUP-2: factor=%.1f", math.Round((btp.params.QiFloat64(0)/btp.evalModPoly.MessageRatio())/ctOut.Scale))
+		btp.ScaleUp(ctOut, math.Round((btp.params.QiFloat64(0)/btp.evalModPoly.MessageRatio())/ctOut.Scale), ctOut)
+	}
+
+	// Step 1 : Extend the basis from q to Q
+	ctOut = btp.modUpFromQ0(ctOut)
+
+	btpLog("AFTER-MODUP: level=%d scale=2^%.2f", ctOut.Level(), math.Log2(ctOut.Scale))
+
+	// Scale the message from Q0/|m| to QL/|m|, where QL is the largest modulus used during the bootstrapping.
+	if (btp.evalModPoly.ScalingFactor()/btp.evalModPoly.MessageRatio())/ctOut.Scale > 1 {
+		btpLog("SCALEUP-3: factor=%.1f", math.Round((btp.evalModPoly.ScalingFactor()/btp.evalModPoly.MessageRatio())/ctOut.Scale))
+		btp.ScaleUp(ctOut, math.Round((btp.evalModPoly.ScalingFactor()/btp.evalModPoly.MessageRatio())/ctOut.Scale), ctOut)
+	}
+
+	//SubSum X -> (N/dslots) * Y^dslots
+	btp.Trace(ctOut, btp.params.LogSlots(), ctOut)
+
+	btpLog("AFTER-TRACE: level=%d scale=2^%.2f", ctOut.Level(), math.Log2(ctOut.Scale))
+
+	// Step 2 : CoeffsToSlots (Homomorphic encoding)
+	ctReal, ctImag := btp.CoeffsToSlotsNew(ctOut, btp.ctsMatrices)
+
+	btpLog("AFTER-CTS: ctReal level=%d scale=2^%.2f ctImag=%v",
+		ctReal.Level(), math.Log2(ctReal.Scale), ctImag != nil)
+	btpDecryptPrint("AFTER-CTS-ctReal", ctReal, btp.params.LogSlots())
+
+	// Step 3 : EvalMod (Homomorphic modular reduction)
+	// ctReal = Ecd(real)
+	// ctImag = Ecd(imag)
+	// If n < N/2 then ctReal = Ecd(real|imag)
+	ctReal = btp.EvalModNew(ctReal, btp.evalModPoly)
+	btpLog("AFTER-EVALMOD: ctReal level=%d scale=2^%.2f scalingFactor=2^%.2f msgRatio=%.1f",
+		ctReal.Level(), math.Log2(ctReal.Scale),
+		math.Log2(btp.evalModPoly.ScalingFactor()),
+		btp.evalModPoly.MessageRatio())
+	btpDecryptPrint("AFTER-EVALMOD-ctReal", ctReal, btp.params.LogSlots())
+	ctReal.Scale = btp.params.DefaultScale()
+	btpLog("AFTER-SCALE-RESET: ctReal level=%d scale=2^%.2f", ctReal.Level(), math.Log2(ctReal.Scale))
+
+	if ctImag != nil {
+		ctImag = btp.EvalModNew(ctImag, btp.evalModPoly)
+		ctImag.Scale = btp.params.DefaultScale()
+	}
+
+	// Step 4 : SlotsToCoeffs (Homomorphic decoding)
+	ctOut = btp.SlotsToCoeffsNew(ctReal, ctImag, btp.stcMatrices)
+
+	btpLog("OUTPUT: level=%d scale=2^%.2f", ctOut.Level(), math.Log2(ctOut.Scale))
+
+	return
+}
+
+func (btp *Bootstrapper) modUpFromQ0(ct *ckks.Ciphertext) *ckks.Ciphertext {
+
+	if btp.swkDtS != nil {
+		btp.SwitchKeys(ct, btp.swkDtS, ct)
+	}
+
+	ringQ := btp.params.RingQ()
+	ringP := btp.params.RingP()
+
+	for i := range ct.Value {
+		ringQ.InvNTTLvl(ct.Level(), ct.Value[i], ct.Value[i])
+	}
+
+	// Extend the ciphertext with zero polynomials.
+	ct.Resize(ct.Degree(), btp.params.MaxLevel())
+
+	levelQ := btp.params.QCount() - 1
+	levelP := btp.params.PCount() - 1
+
+	Q := ringQ.Modulus
+	P := ringP.Modulus
+	q := Q[0]
+	bredparamsQ := ringQ.BredParams
+	bredparamsP := ringP.BredParams
+
+	var coeff, tmp, pos, neg uint64
+
+	// ModUp q->Q for ct[0] centered around q
+	for j := 0; j < btp.params.N(); j++ {
+
+		coeff = ct.Value[0].Coeffs[0][j]
+		pos, neg = 1, 0
+		if coeff >= (q >> 1) {
+			coeff = q - coeff
+			pos, neg = 0, 1
+		}
+
+		for i := 1; i < levelQ+1; i++ {
+			tmp = ring.BRedAdd(coeff, Q[i], bredparamsQ[i])
+			ct.Value[0].Coeffs[i][j] = tmp*pos + (Q[i]-tmp)*neg
+		}
+	}
+
+	if btp.swkStD != nil {
+
+		ks := btp.GetRLWEEvaluator()
+
+		// ModUp q->QP for ct[1] centered around q
+		for j := 0; j < btp.params.N(); j++ {
+
+			coeff = ct.Value[1].Coeffs[0][j]
+			pos, neg = 1, 0
+			if coeff > (q >> 1) {
+				coeff = q - coeff
+				pos, neg = 0, 1
+			}
+
+			for i := 0; i < levelQ+1; i++ {
+				tmp = ring.BRedAdd(coeff, Q[i], bredparamsQ[i])
+				ks.BuffDecompQP[0].Q.Coeffs[i][j] = tmp*pos + (Q[i]-tmp)*neg
+
+			}
+
+			for i := 0; i < levelP+1; i++ {
+				tmp = ring.BRedAdd(coeff, P[i], bredparamsP[i])
+				ks.BuffDecompQP[0].P.Coeffs[i][j] = tmp*pos + (P[i]-tmp)*neg
+			}
+		}
+
+		for i := len(ks.BuffDecompQP) - 1; i >= 0; i-- {
+			ringQ.NTTLvl(levelQ, ks.BuffDecompQP[0].Q, ks.BuffDecompQP[i].Q)
+		}
+
+		for i := len(ks.BuffDecompQP) - 1; i >= 0; i-- {
+			ringP.NTTLvl(levelP, ks.BuffDecompQP[0].P, ks.BuffDecompQP[i].P)
+		}
+
+		ringQ.NTTLvl(levelQ, ct.Value[0], ct.Value[0])
+
+		ks.KeyswitchHoisted(levelQ, ks.BuffDecompQP, btp.swkStD, ks.BuffQP[1].Q, ct.Value[1], ks.BuffQP[1].P, ks.BuffQP[2].P)
+		ringQ.AddLvl(levelQ, ct.Value[0], ks.BuffQP[1].Q, ct.Value[0])
+
+	} else {
+
+		for j := 0; j < btp.params.N(); j++ {
+
+			coeff = ct.Value[1].Coeffs[0][j]
+			pos, neg = 1, 0
+			if coeff >= (q >> 1) {
+				coeff = q - coeff
+				pos, neg = 0, 1
+			}
+
+			for i := 1; i < levelQ+1; i++ {
+				tmp = ring.BRedAdd(coeff, Q[i], bredparamsQ[i])
+				ct.Value[1].Coeffs[i][j] = tmp*pos + (Q[i]-tmp)*neg
+			}
+		}
+
+		ringQ.NTTLvl(levelQ, ct.Value[0], ct.Value[0])
+		ringQ.NTTLvl(levelQ, ct.Value[1], ct.Value[1])
+	}
+
+	return ct
+}

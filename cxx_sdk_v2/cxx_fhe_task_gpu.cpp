@@ -1,0 +1,162 @@
+/*
+ * Copyright (c) 2025-2026 CipherFlow (Shenzhen) Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <chrono>
+#include <cstdlib>
+#include <exception>
+#include <iostream>
+#include <unordered_map>
+
+#include "cxx_fhe_task.h"
+#include "cxx_abi_bridge_executors.h"
+#include "../mega_ag_runners/wrapper.h"
+
+namespace lattisense {
+
+namespace {
+using SteadyClock = std::chrono::steady_clock;
+
+bool gpu_timing_enabled() {
+    return std::getenv("LATTISENSE_GPU_TIMING") != nullptr;
+}
+
+void print_gpu_task_elapsed(const char* label, SteadyClock::time_point start) {
+    if (!gpu_timing_enabled()) {
+        return;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(SteadyClock::now() - start);
+    std::cout << "[GPU Task] " << label << ": " << elapsed.count() / 1000.0 << " s" << std::endl;
+}
+
+}  // namespace
+
+const int GPU_PLAINTEXT_MFORM_BITS = 0;
+const int GPU_KEY_MFORM_BITS = 0;
+
+FheTaskGpu::FheTaskGpu(const std::string& project_path) : FheTask{project_path} {
+    task_handle = create_fhe_gpu_task(project_path.c_str());
+
+    bind_abi_executors();
+}
+
+FheTaskGpu::~FheTaskGpu() {
+    release_fhe_gpu_task(task_handle);
+}
+
+void FheTaskGpu::bind_abi_executors() {
+    // Create ABI export executor (Handle → c_struct, for pre-allocation)
+    ExecutorFunc abi_export =
+        create_abi_export_executor(
+            _algo, true, GPU_PLAINTEXT_MFORM_BITS, GPU_KEY_MFORM_BITS, false);
+
+    // Create ABI import executor (c_struct → Handle, for intermediate data and output write-back)
+    ExecutorFunc abi_import = create_abi_import_executor(_algo, true);
+
+    // Call C interface to bind these executors
+    // GPU uses both: export for inputs (Handle → c_struct), import for intermediate and output nodes
+    bind_gpu_task_abi_bridge_executors(task_handle, reinterpret_cast<void*>(&abi_export),
+                                       reinterpret_cast<void*>(&abi_import));
+}
+
+void FheTaskGpu::bind_custom_executors(const std::unordered_map<std::string, ExecutorFunc>& custom_executors) {
+    // Prepare arrays for C interface
+    std::vector<const char*> custom_types;
+    std::vector<void*> executor_ptrs;
+
+    for (const auto& [custom_type, executor] : custom_executors) {
+        custom_types.push_back(custom_type.c_str());
+        executor_ptrs.push_back(reinterpret_cast<void*>(const_cast<ExecutorFunc*>(&executor)));
+    }
+
+    // Call C interface
+    bind_gpu_task_custom_executors(task_handle, custom_types.data(), executor_ptrs.data(), custom_types.size());
+}
+
+uint64_t FheTaskGpu::run(FheContext* context,
+                         const std::vector<CxxVectorArgument>& cxx_args,
+                         ProgressCallback progress_cb,
+                         int gpu_device) {
+    auto start = std::chrono::high_resolution_clock::now();
+    auto phase_start = SteadyClock::now();
+
+    int n_in_args = 0, n_out_args = 0;
+    n_in_args = check_signatures(context, cxx_args, _task_signature, _algo);
+    n_out_args = cxx_args.size() - n_in_args;
+    print_gpu_task_elapsed("signature check", phase_start);
+    phase_start = SteadyClock::now();
+
+    // Check parameter
+    check_parameter(context, _param_json);
+    print_gpu_task_elapsed("parameter check", phase_start);
+    phase_start = SteadyClock::now();
+
+    nlohmann::json key_signature = _task_signature["key"];
+
+    new_args(n_in_args, n_out_args);
+    print_gpu_task_elapsed("argument allocation", phase_start);
+    phase_start = SteadyClock::now();
+
+    // Export cxx arguments to Handle (same as CPU wrapper)
+    export_cxx_arguments(cxx_args, input_args, output_args);
+    print_gpu_task_elapsed("export cxx args", phase_start);
+    phase_start = SteadyClock::now();
+
+    export_public_key_arguments(key_signature, input_args, context, _key_storage);
+    print_gpu_task_elapsed("export public keys", phase_start);
+    phase_start = SteadyClock::now();
+
+    // Wrap std::function into C callback
+    progress_callback_t c_cb = nullptr;
+    void* c_ud = nullptr;
+    if (progress_cb) {
+        c_cb = [](int completed, int total, void* ud) {
+            auto* fn = static_cast<ProgressCallback*>(ud);
+            (*fn)(completed, total);
+        };
+        c_ud = &progress_cb;
+    }
+
+    // Call GPU runner (Handle will be converted via ABI bridge executors in MegaAG)
+    if (gpu_timing_enabled()) {
+        std::cout << "[GPU Task] run_fhe_gpu_task begin: inputs=" << input_args.size()
+                  << " outputs=" << output_args.size() << " gpu=" << gpu_device << std::endl;
+    }
+    const uint64_t evaluation_context_identity = reinterpret_cast<uint64_t>(context);
+    const uint64_t evaluation_context_handle = context->get();
+    int ret = run_fhe_gpu_task(task_handle, input_args.data(), input_args.size(), output_args.data(),
+                               output_args.size(), c_cb, c_ud, gpu_device, evaluation_context_identity,
+                               evaluation_context_handle);
+    print_gpu_task_elapsed("run_fhe_gpu_task", phase_start);
+    phase_start = SteadyClock::now();
+
+    if (ret != 0) {
+        throw std::runtime_error("Failed to run GPU project");
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+    if (gpu_timing_enabled()) {
+        std::cout << "[GPU Task] total wrapper: " << duration.count() / 1.0e9 << " s" << std::endl;
+    }
+#ifdef LATTISENSE_DEV
+    std::cout << "Run GPU time: " << duration.count() / 1.0e6 << " ms" << std::endl;
+#endif
+
+    return duration.count();
+}
+}  // namespace lattisense
